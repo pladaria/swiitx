@@ -257,16 +257,36 @@ fn canonical_exit_preserves_dynamic_pc_until_writeback_finishes() {
             if !native(abi) {
                 continue;
             }
-            let (owner, id) = compile(&code);
+            let owner = published::Published::new(|process, cache| {
+                let ingress = if matches!(pc, ValueLocation::Constant(_)) {
+                    contracts(abi, &[]).1
+                } else {
+                    entry
+                };
+                published::synthetic(
+                    process.begin_unit(crate::executable::Tier::Lcq).unwrap(),
+                    cache,
+                    ingress,
+                    source,
+                    (vec![], None),
+                    pc,
+                    NativeExitReason::Control,
+                )
+            });
             let mut state = A64State::default();
             state.general_register_storage_mut()[0] = 0x123456789abcdef0;
             {
                 let mut frame = NativeFrame::new(&mut state, PollBudget::new(7, 11).unwrap());
-                unsafe { frame.begin_fp() };
-                frame.execution_epoch = 1;
-                let address = owner.get_finalized_function(id);
+                let mut reader = owner.process.register().unwrap();
+                let mut invocation = unsafe { reader.admit(&mut frame, published::key()) }
+                    .unwrap()
+                    .unwrap();
+                let address =
+                    invocation.payload().preferred().unwrap().canonical.get() as *const u8;
+                let epoch = invocation.frame().execution_epoch;
                 let result =
-                    unsafe { enter_protected(&mut frame, std::ptr::null_mut(), address) }.unwrap();
+                    unsafe { enter_protected(invocation.frame(), std::ptr::null_mut(), address) }
+                        .unwrap();
                 assert_eq!(
                     result.poll,
                     PollOutcome {
@@ -274,13 +294,14 @@ fn canonical_exit_preserves_dynamic_pc_until_writeback_finishes() {
                         exhausted: false
                     }
                 );
-                assert_eq!(frame.exit_pc, 0x123456789abcdef0);
-                assert_eq!(frame.budget.slice_remaining, 11);
-                assert_eq!(frame.execution_epoch, 1);
-                frame.execution_epoch = 0;
+                assert_eq!(invocation.frame().exit_pc, 0x123456789abcdef0);
+                assert_eq!(invocation.frame().budget.slice_remaining, 11);
+                assert_eq!(invocation.frame().execution_epoch, epoch);
+                drop(invocation);
+                assert_eq!(frame.execution_epoch, 0);
             }
             assert_eq!(state.pc(), 0x123456789abcdef0);
-            unsafe { owner.free_memory() };
+            owner.shutdown();
         }
     }
 }
@@ -289,11 +310,12 @@ fn canonical_exit_preserves_dynamic_pc_until_writeback_finishes() {
 fn invalid_native_budget_restores_fp_without_announcing_quiescence() {
     let _restore = crate::fp_env::tests::RestoreHost::new();
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
-        let (source, _) = contracts(abi, &[]);
+        let (source, entry) = contracts(abi, &[]);
         let mut code = landing(abi);
         let mut invalid = moves::Emitter::new(abi);
         invalid.constant(abi.reserved().poll, 8, 8); // Armed span is only seven.
-        code.extend(invalid.finish());
+        let body = invalid.finish();
+        code.extend(&body);
         code.extend(
             emit_canonical_exit(
                 &source,
@@ -305,31 +327,54 @@ fn invalid_native_budget_restores_fp_without_announcing_quiescence() {
         if !native(abi) {
             continue;
         }
-        let (owner, id) = compile(&code);
+        let owner = published::Published::new(|process, cache| {
+            published::synthetic(
+                process.begin_unit(crate::executable::Tier::Lcq).unwrap(),
+                cache,
+                entry,
+                source,
+                (body, None),
+                ValueLocation::Constant(4),
+                NativeExitReason::Internal,
+            )
+        });
         let mut state = A64State::default();
         {
             let mut frame = NativeFrame::new(&mut state, PollBudget::new(7, 11).unwrap());
-            unsafe { frame.begin_fp() };
-            frame.execution_epoch = 1;
-            let address = owner.get_finalized_function(id);
+            let mut reader = owner.process.register().unwrap();
+            let mut invocation = unsafe { reader.admit(&mut frame, published::key()) }
+                .unwrap()
+                .unwrap();
+            let address = invocation.payload().preferred().unwrap().canonical.get() as *const u8;
+            let epoch = invocation.frame().execution_epoch;
             let result = unsafe {
-                frame.ensure_fp().unwrap();
+                invocation.frame().ensure_fp().unwrap();
                 crate::fp_env::tests::divide_by_zero();
-                enter_protected(&mut frame, std::ptr::null_mut(), address)
+                enter_protected(invocation.frame(), std::ptr::null_mut(), address)
             };
             assert_eq!(
                 result,
                 Err(NativeReturnError::Budget(BudgetError::InvalidDeadline))
             );
-            assert_eq!((frame.host_fp.saved, frame.host_fp.active), (0, 0));
-            assert_eq!(unsafe { *frame.canonical.fpsr }, 2);
             assert_eq!(
-                (frame.budget.sample_remaining, frame.budget.slice_remaining),
+                (
+                    invocation.frame().host_fp.saved,
+                    invocation.frame().host_fp.active
+                ),
+                (0, 0)
+            );
+            assert_eq!(unsafe { *invocation.frame().canonical.fpsr }, 2);
+            assert_eq!(
+                (
+                    invocation.frame().budget.sample_remaining,
+                    invocation.frame().budget.slice_remaining
+                ),
                 (7, 11)
             );
-            assert_eq!(frame.execution_epoch, 1);
-            frame.execution_epoch = 0;
+            assert_eq!(invocation.frame().execution_epoch, epoch);
+            drop(invocation);
+            assert_eq!(frame.execution_epoch, 0);
         }
-        unsafe { owner.free_memory() };
+        owner.shutdown();
     }
 }

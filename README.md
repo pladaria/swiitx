@@ -27,6 +27,21 @@ supported through the emulated HID services.
   </tr>
 </table>
 
+## Modified Cranelift backend
+
+Nixe uses a modified [Cranelift](https://cranelift.dev/) compiler to translate console instructions into native CPU code. Main changes:
+
+- **Less repeated setup:** entering and leaving a chain of compiled blocks shares one setup and cleanup step for the whole chain.
+- **Context kept close:** dedicated CPU registers keep frequently needed emulator data ready to use, for example, the guest-memory base address, the remaining instruction budget, a pointer to shared working space and more.
+- **Shared working space:** blocks use a fixed area for temporary values without growing the host stack.
+- **Multiple entry points:** execution can enter an optimized region at selected positions without duplicating its code.
+- **Fewer data transfers:** blocks know where their inputs and outputs live, so transitions move only what is needed.
+- **Direct links:** jumps in generated machine code can be patched to point directly to compiled destinations, so linked blocks jump straight to one another without returning to the emulator's control code or repeating destination lookups.
+- **Precise fault recovery data:** memory accesses carry the information needed to reconstruct the emulated CPU state if they fault.
+- **Easier maintenance:** readable compiler output and focused tests help catch regressions when updating Cranelift.
+
+See [Cranelift modifications](docs/cranelift-modifications.md) for implementation details.
+
 ## Running
 
 See [host requirements](docs/host-requirements.md) for the required CPU capabilities.

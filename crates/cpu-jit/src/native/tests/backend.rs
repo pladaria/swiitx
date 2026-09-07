@@ -1,5 +1,5 @@
 //! Real fork output -> shared contracts -> Nixe adapters -> system gateway.
-//! The byte owner below is test-only, pending Task 2's publication allocator.
+//! Unlinked proofs use production publication; linked fixtures await Task 4.
 use super::*;
 use cranelift_codegen::{
     CompiledCode, Context,
@@ -13,6 +13,125 @@ use cranelift_codegen::{
 use nixe_cpu::state::a64::{A64State, Nzcv};
 
 mod arithmetic;
+
+fn publish_unlinked(
+    abi: HostAbi,
+    code: CompiledCode,
+    contract: EntryContract,
+    mut state: ExitStateMap,
+) -> published::Published {
+    use crate::executable::{Tier, output::Output};
+    use crate::lifetime::unit::{Entry, Input, Instruction, StateRecord};
+    published::Published::new(|process, cache| {
+        let identity = process.begin_unit(Tier::Lcq).unwrap();
+        state.site = ExitSiteKey {
+            source: identity.version(),
+            state_map: 0,
+        };
+        let input = boundary(abi, &code, 10).map.offset;
+        let output = boundary(abi, &code, 20).map.clone();
+        // compile() rejects all relocations in these fixtures, so there are no
+        // function-local symbol indices to resolve from the emptied function.
+        let mut staged = Output::from_backend(abi, code, &ir::Function::new()).unwrap();
+        let mut bytes = staged.bytes.into_vec();
+        let end = append_exit(&mut bytes, &state);
+        output.patch_exit(&mut bytes, 0, end as u64).unwrap();
+        let start = canonical_ingress(abi, &mut bytes, &contract, input as usize);
+        staged.bytes = bytes.into_boxed_slice();
+        let code = cache.install(staged, Tier::Lcq, |_| None).unwrap();
+        Input {
+            identity,
+            code,
+            tier: Tier::Lcq,
+            instructions: Box::new([Instruction {
+                key: InstructionKey::new(published::key()).unwrap(),
+                bits: 0xd503201f,
+            }]),
+            entries: Box::new([Entry {
+                key: published::key(),
+                canonical_offset: start as u32,
+                fast_offset: input,
+                contract,
+            }]),
+            dependencies: Box::new([]),
+            cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+            states: Box::new([StateRecord {
+                native_offset: output.offset,
+                state,
+            }]),
+            faults: Box::new([]),
+        }
+    })
+}
+
+fn run_unlinked(unit: &published::Published, cpu: &mut A64State, frame_extent: u32) {
+    let mut reader = unit.process.register().unwrap();
+    let mut frame = NativeFrame::new(cpu, PollBudget::new(17, 23).unwrap());
+    let frame_address = &frame as *const NativeFrame as u64;
+    frame.spill.fill(MaybeUninit::new(0xa5));
+    let mut invocation = unsafe { reader.admit(&mut frame, published::key()) }
+        .unwrap()
+        .unwrap();
+    let entry = invocation.payload().preferred().unwrap();
+    let epoch = invocation.frame().execution_epoch;
+    let result = unsafe {
+        invocation.frame().ensure_fp().unwrap();
+        enter_protected(
+            invocation.frame(),
+            std::ptr::dangling_mut(),
+            entry.canonical.get() as *const u8,
+        )
+    }
+    .unwrap();
+    let native_frame = invocation.frame();
+    assert_eq!(result.reason, NativeExitReason::Dispatch);
+    assert_eq!(
+        (
+            native_frame.exit_source_version,
+            native_frame.exit_state_map
+        ),
+        (entry.version.get(), 0)
+    );
+    assert_eq!(native_frame.execution_epoch, epoch);
+    assert_ne!(epoch, 0);
+    assert_eq!(
+        (
+            native_frame.host_fp.saved,
+            native_frame.host_fp.active,
+            native_frame.gateway_exit
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        (
+            native_frame.budget.sample_remaining,
+            native_frame.budget.slice_remaining
+        ),
+        (17, 23)
+    );
+    let word = |offset: usize| {
+        u64::from_le_bytes(std::array::from_fn(|i| unsafe {
+            native_frame.spill[offset + i].assume_init()
+        }))
+    };
+    assert_eq!(word(1024), 1);
+    assert_eq!(word(1032), 17);
+    assert_eq!(word(1040), frame_address);
+    assert_eq!(word(1056), word(1064));
+    assert_eq!(word(1056) % 16, 0);
+    assert!(
+        native_frame.spill[64..1024]
+            .iter()
+            .all(|byte| unsafe { byte.assume_init() } == 0xa5)
+    );
+    assert!(
+        native_frame.spill[frame_extent as usize..]
+            .iter()
+            .all(|byte| unsafe { byte.assume_init() } == 0xa5)
+    );
+    drop(invocation);
+    assert_eq!(frame.execution_epoch, 0);
+}
 
 fn compile(abi: HostAbi, allocator: &str, mut function: ir::Function) -> CompiledCode {
     let mut flags = settings::builder();
@@ -716,17 +835,11 @@ fn randomized_final_maps_reconstruct_live_state_with_bounded_spills() {
                 // Require physical reconstruction of EVERY live vector here;
                 // leaving the unchanged vectors canonical would hide bad spills.
                 state.dirty_live.vector = state.live.vector;
-                let mut bytes = code.code_buffer().to_vec();
-                let exit_offset = append_exit(&mut bytes, &state);
-                output
-                    .map
-                    .patch_exit(&mut bytes, 0, exit_offset as u64)
-                    .unwrap();
-                let start =
-                    canonical_ingress(abi, &mut bytes, &contract, input.map.offset as usize);
                 if !canonical::native(abi) {
                     continue;
                 }
+                let frame_extent = extent(&code);
+                let unit = publish_unlinked(abi, code, contract, state);
                 let mut actual = A64State::default();
                 for value in actual.general_register_storage_mut() {
                     *value = next(&mut seed);
@@ -757,8 +870,9 @@ fn randomized_final_maps_reconstruct_live_state_with_bounded_spills() {
                     high | u128::from(f64::INFINITY.to_bits());
                 expected.set_fpsr((1 << 27) | 2);
                 expected.set_pc(0x12345678);
-                run(abi, &bytes, start, &mut actual, (2, 20), extent(&code));
+                run_unlinked(&unit, &mut actual, frame_extent);
                 assert_eq!(actual, expected, "{abi:?}/{allocator}/case={case}");
+                unit.shutdown();
             }
         }
     }

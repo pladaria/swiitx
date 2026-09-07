@@ -391,7 +391,6 @@ fn pending_host_fpsr_is_merged_after_software_writeback() {
             };
             {
                 let mut frame = NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap());
-                frame.execution_epoch = 7;
                 initialize(&mut frame);
                 for offset in [4096, 3240] {
                     for (index, byte) in software.to_le_bytes().into_iter().enumerate() {
@@ -401,7 +400,7 @@ fn pending_host_fpsr_is_merged_after_software_writeback() {
                 // The fixture raises a real divide-by-zero, then executes data
                 // writeback before returning directly to shared FP completion.
                 invoke_with_fp(abi, code, &mut frame);
-                assert_eq!(frame.execution_epoch, 7);
+                assert_eq!(frame.execution_epoch, 0); // Direct lease, no dispatch lookup.
                 assert_eq!(
                     (
                         frame.host_fp.active,

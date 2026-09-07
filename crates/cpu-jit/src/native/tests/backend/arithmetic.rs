@@ -109,14 +109,11 @@ fn arithmetic_recipes_use_final_ssa_operand_locations() {
                         // This fragment performs no FP operation, but the
                         // gateway must still restore the caller environment.
                         state.host_fpsr_pending = false;
-                        let mut bytes = code.code_buffer().to_vec();
-                        let end = append_exit(&mut bytes, &state);
-                        output.map.patch_exit(&mut bytes, 0, end as u64).unwrap();
-                        let start =
-                            canonical_ingress(abi, &mut bytes, &ingress, input.map.offset as usize);
                         if !canonical::native(abi) {
                             continue;
                         }
+                        let frame_extent = extent(&code);
+                        let unit = publish_unlinked(abi, code, ingress, state);
                         let bit_width = BitWidth::new(width).unwrap();
                         let sign = 1u128 << (width - 1);
                         for (a, b, c) in [
@@ -153,12 +150,13 @@ fn arithmetic_recipes_use_final_ssa_operand_locations() {
                                     | u32::from(result.overflow) << 28,
                             ));
                             expected.set_pc(0x12345678);
-                            run(abi, &bytes, start, &mut actual, (2, 20), extent(&code));
+                            run_unlinked(&unit, &mut actual, frame_extent);
                             assert_eq!(
                                 actual, expected,
                                 "{abi:?}/{allocator}/width={width}/kind={kind}/count={count}/a={a:x}/b={b:x}/c={c}"
                             );
                         }
+                        unit.shutdown();
                     }
                 }
             }

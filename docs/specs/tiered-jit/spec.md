@@ -114,6 +114,9 @@ fork commit using `rev`, and update `Cargo.lock` with dependency changes. Do
 not use a floating branch dependency or commit a machine-local path override.
 The backend changes required by Task 1 are made in this fork.
 
+See [Cranelift modifications](../../cranelift-modifications.md) for the
+implemented fork changes, their motivation and their benefits to Nixe.
+
 ## Evidence from reference engines
 
 The architecture deliberately combines two proven families instead of copying
@@ -259,7 +262,7 @@ runtime tuner or title override.
 | virtual executable reservation                         |                                                                   2047 MiB |
 | executable segment size                                |                                                                     16 MiB |
 | link-island reservation per segment                    |                                                                     64 KiB |
-| committed-code soft limit                              |                                                                    512 MiB |
+| committed code+metadata soft limit                     |                                                                    512 MiB |
 | committed code+metadata hard limit                     |                                                                    640 MiB |
 | LCQ emergency reserve                                  |                                                                     32 MiB |
 | LCQ compiler policy                                    |                                                opt_level=none, single_pass |
@@ -362,6 +365,11 @@ epoch and maintenance request sequence are checked u64 counters. They never
 wrap: exhaustion disables HCQ and produces a precise capacity failure on the
 next operation that requires new LCQ publication or lifecycle transition.
 
+Reserve the unit identity and captured admission epoch before emitting native
+exits that embed its CodeVersion. Publication consumes that identity unchanged;
+it must not relabel state maps after emission or accept code from an older
+admission epoch. Abandoned emission identities are never reused.
+
 An immutable CodeUnit owns:
 
 - tier and backend ABI version;
@@ -412,10 +420,11 @@ The runtime has the following authorities; none is append-only:
 - the native-PC directory derives a segment slot from the fault address and
   acquire-loads that segment generation's immutable sorted fault table.
 
-The native-PC directory has one fixed slot per possible 16 MiB segment in the
-2047 MiB executable reservation. It is safe for bounded signal-time lookup and
-does not allocate or lock. All other indexes are cold-path structures and are
-never consulted by ordinary generated RAM operations or resolved static links.
+The native-PC directory has 128 fixed slots: 127 full 16 MiB segments and one
+final 15 MiB segment in the 2047 MiB executable reservation. It is safe for
+bounded signal-time lookup and does not allocate or lock. All other indexes are
+cold-path structures and are never consulted by ordinary generated RAM
+operations or resolved static links.
 
 Registries use reusable generational slabs. A queued compiler/link job owns a
 strong reference to every CodeUnit snapshot it reads. Removal from an index
@@ -1029,6 +1038,15 @@ old/new cutover versions. LCQ and HCQ use separate active segment lists but may
 borrow unused segments. At least 32 MiB of the hard budget remains unavailable
 to HCQ so background compilation cannot prevent LCQ forward progress.
 
+The 2047 MiB bound describes the executable-address window. The separate
+nonexecutable RW alias is outside that window; shared backing is charged once,
+not once per alias. Segments 0 through 126 have 16 MiB each; segment 127 has
+15 MiB. Each reserves its final 64 KiB for islands, including the last segment.
+Bounds checks precede `(native_pc - executable_base) / 16 MiB`; the missing
+final 1 MiB is neither reserved executable capacity nor an allocatable span.
+No allocation may cross a segment boundary. Decommit must release backing
+storage, not merely change its virtual permissions to PROT_NONE.
+
 Each segment is:
 
 - writable and nonexecutable while being populated;
@@ -1043,6 +1061,12 @@ patch rendezvous; it is otherwise PROT_NONE. A platform which forbids dual
 aliases uses RW-to-RX protection transitions at the same rendezvous. No virtual
 mapping is simultaneously writable and executable, and guest code can never
 address the writable alias.
+
+With dual aliases, populating an unreachable span may coexist with execution
+of other spans in that segment. Only the unpublished span is written; opening
+the RW alias does not authorize modifying callable bytes. Reuse of a formerly
+published span still requires unlink, epoch quiescence and release of all
+protecting references. Relocations use RX addresses, never RW alias addresses.
 
 Each segment has a bump frontier plus a coalescing free-span map. Allocation
 uses the smallest fitting span, then lowest address, and falls back to the bump

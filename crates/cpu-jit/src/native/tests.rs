@@ -9,6 +9,7 @@ mod backend;
 mod canonical;
 mod flags;
 mod gateway;
+mod published;
 
 fn register(class: RegisterClass, index: u8) -> ValueLocation {
     ValueLocation::Register { class, index }
@@ -295,7 +296,8 @@ fn randomized_full_register_files_with_aliases_and_spills() {
 // Conventional native test fixture, independent of the move encoder. Assembly
 // loads/captures every allocatable register at its architectural index. This
 // avoids using the emitter under test to initialize or interpret its own maps.
-// JITModule owns executable bytes only for this test; production ownership is Task 2.
+// These isolated register fixtures use a direct allocation lease, not dispatch;
+// complete canonical units exercise protected publication in published.rs.
 fn execute(source: &ExitStateMap, target: &EntryContract, seed: u64) {
     let bytes = emit_fast_transfer(source, target).unwrap();
     if cfg!(target_arch = "x86_64") && source.abi != HostAbi::X86_64
@@ -420,13 +422,27 @@ fn invoke_inner(abi: HostAbi, mut bytes: Vec<u8>, frame: &mut NativeFrame<'_>, f
         HostAbi::X86_64 => bytes.push(0xc3),
         HostAbi::Aarch64 => bytes.extend_from_slice(&0xd65f03c0u32.to_le_bytes()),
     }
-    let mut module = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
-    let id = module
-        .declare_function("boundary", Linkage::Local, &module.make_signature())
+    let cache = crate::executable::Cache::new().unwrap();
+    let code = cache
+        .install(
+            crate::executable::output::Output {
+                bytes: bytes.into_boxed_slice(),
+                alignment: 16,
+                metadata: crate::executable::output::Metadata {
+                    abi,
+                    frame_extent: SPILL_BYTES,
+                    entries: Box::new([]),
+                    states: Box::new([]),
+                    faults: Box::new([]),
+                    traps: Box::new([]),
+                    relocations: Box::new([]),
+                },
+            },
+            crate::executable::Tier::Lcq,
+            |_| None,
+        )
         .unwrap();
-    module.define_function_bytes(id, 16, &bytes, &[]).unwrap();
-    module.finalize_definitions().unwrap();
-    let entry = module.get_finalized_function(id);
+    let entry = code.allocation.address() as *const u8;
     // SAFETY: live frame with initialized physical inputs, RX fragment ending
     // in RET, and fixture preserves the platform's callee-saved registers.
     unsafe {
@@ -440,10 +456,9 @@ fn invoke_inner(abi: HostAbi, mut bytes: Vec<u8>, frame: &mut NativeFrame<'_>, f
             frame.finish_fp();
         }
     }
-    // SAFETY: no executable pointer survives this invocation.
-    unsafe {
-        module.free_memory();
-    }
+    // The exact storage lease survives the assembly fixture; no raw address
+    // escapes it and no callable dispatch root was ever published.
+    drop(code);
 }
 
 fn read(frame: &[u8], location: ValueLocation, bytes: u8, output: bool) -> Vec<u8> {

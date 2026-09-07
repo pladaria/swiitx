@@ -174,6 +174,28 @@ impl<T: Identity> Default for CheckedCounter<T> {
     }
 }
 impl<T: Identity> CheckedCounter<T> {
+    /// Reserve the exact identities for one cold, indivisible metadata update.
+    /// Failure consumes nothing; the returned iterator does not borrow state.
+    pub(crate) fn take_ids(
+        &mut self,
+        count: usize,
+    ) -> Result<impl Iterator<Item = T> + use<T>, IdentityExhausted> {
+        let end = self
+            .last
+            .checked_add(u64::try_from(count).map_err(|_| IdentityExhausted(T::NAME))?)
+            .ok_or(IdentityExhausted(T::NAME))?;
+        let range = self.last..end;
+        self.last = end;
+        Ok(range.map(|value| T::from_nonzero(NonZeroU64::new(value + 1).unwrap())))
+    }
+    #[cfg(test)]
+    pub(crate) fn exhausted() -> Self {
+        Self {
+            last: u64::MAX,
+            marker: PhantomData,
+        }
+    }
+
     pub fn next_id(&mut self) -> Result<T, IdentityExhausted> {
         let next = self.last.checked_add(1).ok_or(IdentityExhausted(T::NAME))?;
         self.last = next;

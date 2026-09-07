@@ -12,6 +12,12 @@ pub mod analysis;
 mod direct;
 mod fp_env;
 mod fp_policy;
+// Task 2 builds this owner before Task 3 replaces the legacy production path.
+#[allow(dead_code)]
+mod lifetime;
+// Storage is assembled into published CodeUnits in Task 2, then used by Task 3.
+#[allow(dead_code)]
+mod executable;
 pub mod native;
 
 pub use direct::{JitProcess, JitThread};

@@ -1219,11 +1219,14 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "hashbrown 0.16.1",
+ "libc",
  "log",
  "nixe-cpu",
  "nixe-cpu-direct-memory",
  "nixe-cpu-interpreter",
  "nixe-memory",
+ "wasmtime-internal-jit-icache-coherence",
 ]
 
 [[package]]
