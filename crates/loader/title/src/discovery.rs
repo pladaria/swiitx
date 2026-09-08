@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,12 +7,23 @@ use std::path::{Path, PathBuf};
 pub struct DirectoryScanOptions {
     /// Whether files in nested directories are included.
     pub recursive: bool,
+    /// Whether symbolic links to files and directories are followed.
+    pub follow_symlinks: bool,
 }
 
 impl DirectoryScanOptions {
     /// Creates directory scan options with recursive discovery enabled.
     pub const fn new() -> Self {
-        Self { recursive: true }
+        Self {
+            recursive: true,
+            follow_symlinks: true,
+        }
+    }
+
+    /// Sets whether symbolic links encountered during discovery are followed.
+    pub const fn with_follow_symlinks(mut self, follow_symlinks: bool) -> Self {
+        self.follow_symlinks = follow_symlinks;
+        self
     }
 
     /// Sets whether files in nested directories are included.
@@ -51,8 +63,19 @@ pub(crate) fn directory_files(
 ) -> Result<Vec<PathBuf>, DirectoryDiscoveryError> {
     let mut directories = vec![path.to_owned()];
     let mut files = Vec::new();
+    let mut visited = BTreeSet::new();
 
     while let Some(directory) = directories.pop() {
+        if options.follow_symlinks {
+            let identity =
+                fs::canonicalize(&directory).map_err(|source| DirectoryDiscoveryError {
+                    path: directory.clone(),
+                    source,
+                })?;
+            if !visited.insert(identity) {
+                continue;
+            }
+        }
         let entries = fs::read_dir(&directory).map_err(|source| DirectoryDiscoveryError {
             path: directory.clone(),
             source,
@@ -71,6 +94,16 @@ pub(crate) fn directory_files(
                     path: entry_path.clone(),
                     source,
                 })?;
+            let file_type = if options.follow_symlinks && file_type.is_symlink() {
+                fs::metadata(&entry_path)
+                    .map_err(|source| DirectoryDiscoveryError {
+                        path: entry_path.clone(),
+                        source,
+                    })?
+                    .file_type()
+            } else {
+                file_type
+            };
             if file_type.is_file() {
                 files.push(entry_path);
             } else if options.recursive && file_type.is_dir() {
@@ -108,6 +141,45 @@ pub(crate) fn package_format(path: &Path) -> Option<PackageFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinks_without_revisiting_directories() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "nixe-symlinks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("library")).unwrap();
+        fs::create_dir(root.join("external")).unwrap();
+        fs::write(root.join("external/game.nro"), []).unwrap();
+        fs::write(root.join("standalone.nro"), []).unwrap();
+        symlink(root.join("external"), root.join("library/linked")).unwrap();
+        symlink(root.join("external"), root.join("library/duplicate")).unwrap();
+        symlink(root.join("library"), root.join("external/cycle")).unwrap();
+        symlink(root.join("standalone.nro"), root.join("library/file.nro")).unwrap();
+        let scan = |options| {
+            directory_files(&root.join("library"), options)
+                .unwrap_or_else(|_| panic!("directory discovery failed"))
+        };
+        let files = scan(DirectoryScanOptions::new());
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("game.nro")));
+        assert!(files.iter().any(|path| path.ends_with("file.nro")));
+        assert!(scan(DirectoryScanOptions::new().with_follow_symlinks(false)).is_empty());
+        assert_eq!(
+            scan(DirectoryScanOptions::new().with_recursive(false)),
+            vec![root.join("library/file.nro")]
+        );
+        symlink(root.join("missing"), root.join("library/broken")).unwrap();
+        assert!(directory_files(&root.join("library"), DirectoryScanOptions::new()).is_err());
+        assert!(scan(DirectoryScanOptions::new().with_follow_symlinks(false)).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recognizes_all_package_extensions_case_insensitively() {

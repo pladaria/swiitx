@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem::{align_of, offset_of, size_of};
 use std::sync::Mutex;
 
+use crate::analysis::IntegerRegisterSet;
 use cranelift_codegen::ir::{
     self, AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, SourceLoc, TrapCode,
     UserFuncName, condcodes::IntCC, types,
@@ -11,12 +12,9 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
-use nixe_cpu::decode::a64::{A64Instruction, control, fp_simd, integer, memory, system};
+use nixe_cpu::decode::a64::{A64Instruction, control};
 use nixe_cpu::execution::CpuControl;
 use nixe_cpu::location::DecodedInstruction;
-use nixe_cpu::semantics::a64::{
-    SimdMemoryMode, simd_multiple_structure_shape, simd_single_structure_shape,
-};
 use nixe_cpu::semantics::conditions::Condition;
 use nixe_memory::CpuMemoryBackend;
 use nixe_memory::GuestVirtualAddress;
@@ -740,52 +738,7 @@ fn module_error(error: cranelift_module::ModuleError) -> DirectJitError {
     DirectJitError::internal(format!("direct JIT compilation failed: {error}"))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LazyFlags {
-    Canonical(ir::Value),
-    Packed(ir::Value),
-    Add {
-        lhs: ir::Value,
-        rhs: ir::Value,
-        result: ir::Value,
-        width: u8,
-    },
-    Subtract {
-        lhs: ir::Value,
-        rhs: ir::Value,
-        result: ir::Value,
-        width: u8,
-    },
-    AddCarry {
-        lhs: ir::Value,
-        rhs: ir::Value,
-        carry: ir::Value,
-        result: ir::Value,
-        width: u8,
-    },
-    SubtractCarry {
-        lhs: ir::Value,
-        rhs: ir::Value,
-        carry: ir::Value,
-        result: ir::Value,
-        width: u8,
-    },
-    Logical {
-        result: ir::Value,
-        width: u8,
-    },
-    Conditional {
-        predicate: ir::Value,
-        when_true: Box<LazyFlags>,
-        when_false: u32,
-    },
-}
-
-impl LazyFlags {
-    const fn dirty(&self) -> bool {
-        !matches!(self, Self::Canonical(_))
-    }
-}
+type LazyFlags = crate::abi::LazyFlags<ir::Value>;
 
 struct CraneliftTranslator<'a, 'region> {
     builder: FunctionBuilder<'a>,
@@ -873,7 +826,8 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         let fpsr_state = builder.declare_var(types::I32);
         let dirty_at_entry = dirty_states_at_entry(region);
         let register_load_blocks = register_load_blocks(region, &dirty_at_entry);
-        let fp_status_accessed = fp_status_access(region).0;
+        let (read, written) = region_effects(region);
+        let fp_status_accessed = read.fpsr || written.fpsr;
         let uses_native_fp = region_uses_native_fp(region);
         Ok(Self {
             builder,
@@ -967,9 +921,9 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 .load(types::I32, trusted_flags(), self.fpsr, 0);
             self.builder.def_var(self.fpsr_state, initial_fpsr);
         }
-        let (read, written) = register_access(self.region);
+        let (read, written) = region_effects(self.region);
         for index in 0..GENERAL_REGISTER_COUNT {
-            if !read.x[index] && !written.x[index] {
+            if !read.integer.x[index] && !written.integer.x[index] {
                 continue;
             }
             let variable = self.builder.declare_var(types::I64);
@@ -985,7 +939,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             }
             self.registers[index] = Some(variable);
         }
-        if read.sp || written.sp {
+        if read.integer.sp || written.integer.sp {
             let variable = self.builder.declare_var(types::I64);
             if self.register_load_blocks.sp == Some(self.region.key.start) {
                 let value = self
@@ -997,9 +951,8 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             self.stack_pointer = Some(variable);
         }
 
-        let (read_vectors, written_vectors) = vector_register_access(self.region);
-        for index in 0..read_vectors.len() {
-            if !read_vectors[index] && !written_vectors[index] {
+        for index in 0..read.vector.len() {
+            if !read.vector[index] && !written.vector[index] {
                 continue;
             }
             let variable = self.builder.declare_var(types::I8X16);
@@ -2238,95 +2191,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct IntegerRegisterSet {
-    x: [bool; GENERAL_REGISTER_COUNT],
-    sp: bool,
-}
-
-fn register_access(region: &NativeRegion) -> (IntegerRegisterSet, IntegerRegisterSet) {
-    let mut accessed = IntegerRegisterSet::default();
-    let mut dirty = IntegerRegisterSet::default();
-    for block in &region.blocks {
-        for decoded in &block.instructions {
-            match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
-                A64Instruction::Integer(instruction) => {
-                    register_access_integer(instruction, &mut accessed, &mut dirty)
-                }
-                A64Instruction::Memory(instruction) => {
-                    register_access_memory(instruction, &mut accessed, &mut dirty)
-                }
-                A64Instruction::System(instruction) => {
-                    register_access_system(instruction, &mut accessed, &mut dirty)
-                }
-                A64Instruction::FpSimd(instruction) => {
-                    register_access_fp_simd_general(instruction, &mut accessed, &mut dirty)
-                }
-                A64Instruction::Control(control::Instruction::BranchLinkImmediate(_)) => {
-                    mark_write(&mut accessed, &mut dirty, 30, false);
-                }
-                A64Instruction::Control(control::Instruction::BranchRegister(fields)) => {
-                    mark_read(&mut accessed, fields.rn, false);
-                    if fields.branch_register_key == 0xd63f_0000 {
-                        mark_write(&mut accessed, &mut dirty, 30, false);
-                    }
-                }
-                A64Instruction::Control(
-                    control::Instruction::CompareBranch(fields)
-                    | control::Instruction::TestBranch(fields),
-                ) => mark_read(&mut accessed, fields.rd, false),
-                _ => {}
-            }
-        }
-    }
-    (accessed, dirty)
-}
-
-fn vector_register_access(region: &NativeRegion) -> ([bool; 32], [bool; 32]) {
-    let mut accessed = [false; 32];
-    let mut dirty = [false; 32];
-    for block in &region.blocks {
-        for decoded in &block.instructions {
-            if let A64Instruction::FpSimd(instruction) =
-                nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding)
-            {
-                register_access_fp_simd_vector(instruction, &mut accessed, &mut dirty);
-            }
-        }
-    }
-    (accessed, dirty)
-}
-
-fn fp_status_access(region: &NativeRegion) -> (bool, bool) {
-    let mut accessed = false;
-    let mut dirty = false;
-    for block in &region.blocks {
-        for decoded in &block.instructions {
-            match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
-                A64Instruction::FpSimd(instruction)
-                    if a64_fp_simd::fp_lowering_disposition(instruction).accesses_status() =>
-                {
-                    accessed = true;
-                    dirty = true;
-                }
-                A64Instruction::System(system::Instruction::ReadRegister(fields))
-                    if fields.system_key == 0xd53b_4420 =>
-                {
-                    accessed = true;
-                }
-                A64Instruction::System(system::Instruction::WriteRegister(fields))
-                    if fields.system_key == 0xd51b_4420 =>
-                {
-                    accessed = true;
-                    dirty = true;
-                }
-                _ => {}
-            }
-        }
-    }
-    (accessed, dirty)
-}
-
 fn region_uses_native_fp(region: &NativeRegion) -> bool {
     region.blocks.iter().any(|block| {
         block.instructions.iter().any(|decoded| {
@@ -2335,335 +2199,9 @@ fn region_uses_native_fp(region: &NativeRegion) -> bool {
             else {
                 return false;
             };
-            a64_fp_simd::fp_lowering_disposition(instruction).uses_native_status()
+            crate::fp_policy::fp_lowering_disposition(instruction).uses_native_status()
         })
     })
-}
-
-fn register_access_memory(
-    instruction: memory::Instruction,
-    accessed: &mut IntegerRegisterSet,
-    dirty: &mut IntegerRegisterSet,
-) {
-    use nixe_cpu::semantics::a64::{ScalarTransfer, pair_transfer, scalar_transfer};
-
-    let fields = instruction.operands();
-    if !matches!(instruction, memory::Instruction::Literal(_)) {
-        mark_read(accessed, fields.rn, true);
-    }
-    if matches!(instruction, memory::Instruction::Register(_)) {
-        mark_read(accessed, fields.rm, false);
-    }
-    match instruction {
-        memory::Instruction::Literal(_) => mark_write(accessed, dirty, fields.rt, false),
-        memory::Instruction::Unsigned(_)
-        | memory::Instruction::Unscaled(_)
-        | memory::Instruction::PostIndex(_)
-        | memory::Instruction::PreIndex(_)
-        | memory::Instruction::Register(_) => {
-            match scalar_transfer(
-                fields.opc,
-                nixe_cpu::semantics::a64::memory_size(fields.size),
-            ) {
-                Some(ScalarTransfer::Store) => mark_read(accessed, fields.rt, false),
-                Some(ScalarTransfer::Load(_)) => mark_write(accessed, dirty, fields.rt, false),
-                None => {}
-            }
-            if matches!(
-                instruction,
-                memory::Instruction::PostIndex(_) | memory::Instruction::PreIndex(_)
-            ) {
-                mark_write(accessed, dirty, fields.rn, true);
-            }
-        }
-        memory::Instruction::Pair(_) => {
-            if pair_transfer(fields.size, fields.load).is_some() {
-                if fields.load {
-                    mark_write(accessed, dirty, fields.rt, false);
-                    mark_write(accessed, dirty, fields.rt2, false);
-                } else {
-                    mark_read(accessed, fields.rt, false);
-                    mark_read(accessed, fields.rt2, false);
-                }
-                if matches!(fields.mode, 1 | 3) {
-                    mark_write(accessed, dirty, fields.rn, true);
-                }
-            }
-        }
-        memory::Instruction::LoadAcquire(_) | memory::Instruction::LoadExclusive(_) => {
-            mark_write(accessed, dirty, fields.rt, false);
-        }
-        memory::Instruction::LoadExclusivePair(_) => {
-            mark_write(accessed, dirty, fields.rt, false);
-            mark_write(accessed, dirty, fields.rt2, false);
-        }
-        memory::Instruction::StoreRelease(_) => mark_read(accessed, fields.rt, false),
-        memory::Instruction::StoreExclusive(_) => {
-            mark_read(accessed, fields.rt, false);
-            mark_write(accessed, dirty, fields.rm, false);
-        }
-        memory::Instruction::StoreExclusivePair(_) => {
-            mark_read(accessed, fields.rt, false);
-            mark_read(accessed, fields.rt2, false);
-            mark_write(accessed, dirty, fields.rm, false);
-        }
-        memory::Instruction::AtomicReadModifyWrite(_) => {
-            mark_read(accessed, fields.rm, false);
-            mark_write(accessed, dirty, fields.rt, false);
-        }
-        memory::Instruction::CompareAndSwap(_) => {
-            mark_read(accessed, fields.rm, false);
-            mark_read(accessed, fields.rt, false);
-            mark_write(accessed, dirty, fields.rm, false);
-        }
-        memory::Instruction::CompareAndSwapPair(_) => {
-            mark_read(accessed, fields.rm, false);
-            mark_read(accessed, fields.rm.wrapping_add(1), false);
-            mark_read(accessed, fields.rt, false);
-            mark_read(accessed, fields.rt.wrapping_add(1), false);
-            mark_write(accessed, dirty, fields.rm, false);
-            mark_write(accessed, dirty, fields.rm.wrapping_add(1), false);
-        }
-    }
-}
-
-fn register_access_system(
-    instruction: system::Instruction,
-    accessed: &mut IntegerRegisterSet,
-    dirty: &mut IntegerRegisterSet,
-) {
-    let fields = instruction.operands();
-    match instruction {
-        system::Instruction::ReadRegister(_) => mark_write(accessed, dirty, fields.rt, false),
-        system::Instruction::WriteRegister(_) => mark_read(accessed, fields.rt, false),
-        system::Instruction::System(_) if fields.system_key != 0xd508_7500 => {
-            mark_read(accessed, fields.rt, false);
-        }
-        system::Instruction::Hint(_)
-        | system::Instruction::Barrier(_)
-        | system::Instruction::ClearExclusive(_)
-        | system::Instruction::System(_) => {}
-    }
-}
-
-fn register_access_fp_simd_general(
-    instruction: fp_simd::Instruction,
-    accessed: &mut IntegerRegisterSet,
-    dirty: &mut IntegerRegisterSet,
-) {
-    let fields = instruction.operands();
-    match instruction {
-        fp_simd::Instruction::DuplicateGeneral(_)
-        | fp_simd::Instruction::InsertGeneral(_)
-        | fp_simd::Instruction::MoveFromGeneral(_)
-        | fp_simd::Instruction::SignedIntToFloat(_)
-        | fp_simd::Instruction::UnsignedIntToFloat(_) => {
-            mark_read(accessed, fields.rn, false);
-        }
-        fp_simd::Instruction::UnsignedMoveToGeneral(_)
-        | fp_simd::Instruction::MoveToGeneral(_)
-        | fp_simd::Instruction::FloatToSignedInt(_)
-        | fp_simd::Instruction::FloatToUnsignedInt(_) => {
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        fp_simd::Instruction::MemoryUnsigned(_)
-        | fp_simd::Instruction::MemoryUnscaled(_)
-        | fp_simd::Instruction::MemoryPostIndex(_)
-        | fp_simd::Instruction::MemoryPreIndex(_)
-        | fp_simd::Instruction::MemoryRegister(_)
-        | fp_simd::Instruction::MemoryPair(_)
-        | fp_simd::Instruction::MemoryMultipleStructures(_)
-        | fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_)
-        | fp_simd::Instruction::MemorySingleStructure(_)
-        | fp_simd::Instruction::MemorySingleStructurePostIndex(_) => {
-            mark_read(accessed, fields.rn, true);
-            if matches!(instruction, fp_simd::Instruction::MemoryRegister(_))
-                || (matches!(
-                    instruction,
-                    fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_)
-                        | fp_simd::Instruction::MemorySingleStructurePostIndex(_)
-                ) && fields.rm != 31)
-            {
-                mark_read(accessed, fields.rm, false);
-            }
-            if matches!(
-                instruction,
-                fp_simd::Instruction::MemoryPostIndex(_)
-                    | fp_simd::Instruction::MemoryPreIndex(_)
-                    | fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_)
-                    | fp_simd::Instruction::MemorySingleStructurePostIndex(_)
-            ) || (matches!(instruction, fp_simd::Instruction::MemoryPair(_))
-                && matches!(fields.mode, 1 | 3))
-            {
-                mark_write(accessed, dirty, fields.rn, true);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn register_access_fp_simd_vector(
-    instruction: fp_simd::Instruction,
-    accessed: &mut [bool; 32],
-    dirty: &mut [bool; 32],
-) {
-    let fields = instruction.operands();
-    let read = |accessed: &mut [bool; 32], index: u8| {
-        accessed[usize::from(index)] = true;
-    };
-    let write = |_accessed: &mut [bool; 32], dirty: &mut [bool; 32], index: u8| {
-        dirty[usize::from(index)] = true;
-    };
-    match instruction {
-        fp_simd::Instruction::UnsignedMoveToGeneral(_)
-        | fp_simd::Instruction::MoveToGeneral(_)
-        | fp_simd::Instruction::FloatToSignedInt(_)
-        | fp_simd::Instruction::FloatToUnsignedInt(_)
-        | fp_simd::Instruction::CompareZero(_) => read(accessed, fields.rn),
-        fp_simd::Instruction::CompareRegister(_) | fp_simd::Instruction::ConditionalCompare(_) => {
-            read(accessed, fields.rn);
-            read(accessed, fields.rm);
-        }
-        fp_simd::Instruction::MemoryUnsigned(_)
-        | fp_simd::Instruction::MemoryUnscaled(_)
-        | fp_simd::Instruction::MemoryPostIndex(_)
-        | fp_simd::Instruction::MemoryPreIndex(_)
-        | fp_simd::Instruction::MemoryRegister(_) => {
-            if fields.load {
-                write(accessed, dirty, fields.rd);
-            } else {
-                read(accessed, fields.rd);
-            }
-        }
-        fp_simd::Instruction::MemoryPair(_) => {
-            for register in [fields.rd, fields.rt2] {
-                if fields.load {
-                    write(accessed, dirty, register);
-                } else {
-                    read(accessed, register);
-                }
-            }
-        }
-        fp_simd::Instruction::MemoryMultipleStructures(_)
-        | fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_) => {
-            let shape = simd_multiple_structure_shape(fields)
-                .expect("allocation validated the SIMD multiple-structure shape");
-            for index in 0..shape.register_count() {
-                let register = fields.rd.wrapping_add(index) & 31;
-                if fields.load {
-                    if shape.structure_registers > 1 {
-                        read(accessed, register);
-                    }
-                    write(accessed, dirty, register);
-                } else {
-                    read(accessed, register);
-                }
-            }
-        }
-        fp_simd::Instruction::MemorySingleStructure(_)
-        | fp_simd::Instruction::MemorySingleStructurePostIndex(_) => {
-            let shape = simd_single_structure_shape(fields)
-                .expect("allocation validated the SIMD single-structure shape");
-            for index in 0..shape.register_count() {
-                let register = fields.rd.wrapping_add(index) & 31;
-                if !fields.load || matches!(shape.mode, SimdMemoryMode::Lane(_)) {
-                    read(accessed, register);
-                }
-                if fields.load {
-                    write(accessed, dirty, register);
-                }
-            }
-        }
-        fp_simd::Instruction::MoveFromGeneral(_)
-        | fp_simd::Instruction::DuplicateGeneral(_)
-        | fp_simd::Instruction::ModifiedImmediate(_)
-        | fp_simd::Instruction::ScalarFloatImmediate(_)
-        | fp_simd::Instruction::VectorFloatImmediate(_) => {
-            if matches!(instruction, fp_simd::Instruction::ModifiedImmediate(_))
-                && fields.cmode <= 11
-                && fields.cmode & 1 != 0
-                || matches!(instruction, fp_simd::Instruction::MoveFromGeneral(_))
-                    && fields.size & 2 != 0
-                    && fields.opc == 2
-            {
-                read(accessed, fields.rd);
-            }
-            write(accessed, dirty, fields.rd);
-        }
-        fp_simd::Instruction::InsertElement(_) => {
-            read(accessed, fields.rn);
-            read(accessed, fields.rd);
-            write(accessed, dirty, fields.rd);
-        }
-        fp_simd::Instruction::InsertGeneral(_)
-        | fp_simd::Instruction::ShiftRightNarrow(_)
-        | fp_simd::Instruction::ExtractNarrow(_) => {
-            read(accessed, fields.rn);
-            if !matches!(instruction, fp_simd::Instruction::InsertGeneral(_)) && fields.vector_128 {
-                read(accessed, fields.rd);
-            }
-            if matches!(instruction, fp_simd::Instruction::InsertGeneral(_)) {
-                read(accessed, fields.rd);
-            }
-            write(accessed, dirty, fields.rd);
-        }
-        fp_simd::Instruction::Bitwise(_) => {
-            read(accessed, fields.rn);
-            read(accessed, fields.rm);
-            read(accessed, fields.rd);
-            write(accessed, dirty, fields.rd);
-        }
-        fp_simd::Instruction::Integer(_)
-        | fp_simd::Instruction::IntegerCompare(_)
-        | fp_simd::Instruction::IntegerPairwise(_)
-        | fp_simd::Instruction::IntegerMinMax(_)
-        | fp_simd::Instruction::PermuteTwoSource(_)
-        | fp_simd::Instruction::Extract(_)
-        | fp_simd::Instruction::VectorSignedShiftRegister(_)
-        | fp_simd::Instruction::VectorUnsignedShiftRegister(_)
-        | fp_simd::Instruction::VectorFloatDivide(_)
-        | fp_simd::Instruction::VectorFloatMultiplyElement(_)
-        | fp_simd::Instruction::ScalarFloatDivide(_)
-        | fp_simd::Instruction::ScalarFloatAdd(_)
-        | fp_simd::Instruction::ScalarFloatMultiply(_)
-        | fp_simd::Instruction::ScalarFloatConditionalSelect(_) => {
-            read(accessed, fields.rn);
-            read(accessed, fields.rm);
-            write(accessed, dirty, fields.rd);
-        }
-        fp_simd::Instruction::ScalarFloatFusedMultiplyAdd(_) => {
-            read(accessed, fields.rn);
-            read(accessed, fields.rm);
-            read(accessed, fields.ra);
-            write(accessed, dirty, fields.rd);
-        }
-        fp_simd::Instruction::ScalarMove(_)
-        | fp_simd::Instruction::ScalarAbsolute(_)
-        | fp_simd::Instruction::ScalarNegate(_)
-        | fp_simd::Instruction::VectorFloatAbsolute(_)
-        | fp_simd::Instruction::VectorFloatNegate(_)
-        | fp_simd::Instruction::DuplicateElement(_)
-        | fp_simd::Instruction::ScalarShiftRightImmediate(_)
-        | fp_simd::Instruction::VectorShiftRightImmediate(_)
-        | fp_simd::Instruction::ScalarShiftLeftImmediate(_)
-        | fp_simd::Instruction::VectorShiftLeftImmediate(_)
-        | fp_simd::Instruction::ShiftLeftLong(_)
-        | fp_simd::Instruction::CountBits(_)
-        | fp_simd::Instruction::AddAcrossVector(_)
-        | fp_simd::Instruction::VectorSignedIntToFloat(_)
-        | fp_simd::Instruction::VectorUnsignedIntToFloat(_)
-        | fp_simd::Instruction::ScalarVectorSignedIntToFloat(_)
-        | fp_simd::Instruction::ScalarVectorUnsignedIntToFloat(_)
-        | fp_simd::Instruction::ScalarFloatConvert(_)
-        | fp_simd::Instruction::ScalarFloatRound(_)
-        | fp_simd::Instruction::ScalarFloatSquareRoot(_) => {
-            read(accessed, fields.rn);
-            write(accessed, dirty, fields.rd);
-        }
-        fp_simd::Instruction::SignedIntToFloat(_) | fp_simd::Instruction::UnsignedIntToFloat(_) => {
-            write(accessed, dirty, fields.rd);
-        }
-    }
 }
 
 fn merged_flag_entries(region: &NativeRegion) -> HashSet<GuestVirtualAddress> {
@@ -2705,24 +2243,28 @@ fn register_load_blocks(
 ) -> RegisterLoadBlocks {
     let primary = region.key.start;
     let dominators = block_dominators(region);
-    let (_, integer_written) = register_access(region);
-    let (_, vector_written) = vector_register_access(region);
+    let (_, written) = region_effects(region);
+    let live_entries = region_liveness(region)
+        .into_iter()
+        .fold(crate::analysis::StateSet::default(), |live, block| {
+            live.union(block.live_in)
+        });
     let conditionally_dirty = conditionally_dirty_at_entry(region, dirty_at_entry);
     let mut integer_uses: [Vec<GuestVirtualAddress>; GENERAL_REGISTER_COUNT] =
         std::array::from_fn(|_| Vec::new());
     let mut sp_uses = Vec::new();
     let mut vector_uses: [Vec<GuestVirtualAddress>; 32] = std::array::from_fn(|_| Vec::new());
     for block in &region.blocks {
-        let (integer_read, _, vector_read, _, _, _) = block_register_access(block);
-        for (index, read) in integer_read.x.into_iter().enumerate() {
+        let reads = block_effects(block).reads;
+        for (index, read) in reads.integer.x.into_iter().enumerate() {
             if read {
                 integer_uses[index].push(block.start.pc);
             }
         }
-        if integer_read.sp {
+        if reads.integer.sp {
             sp_uses.push(block.start.pc);
         }
-        for (index, read) in vector_read.into_iter().enumerate() {
+        for (index, read) in reads.vector.into_iter().enumerate() {
             if read {
                 vector_uses[index].push(block.start.pc);
             }
@@ -2731,24 +2273,24 @@ fn register_load_blocks(
     let integer = std::array::from_fn(|index| {
         if integer_uses[index].is_empty() && !conditionally_dirty.integer.x[index] {
             None
-        } else if integer_written.x[index] {
-            Some(primary)
+        } else if written.integer.x[index] {
+            live_entries.integer.x[index].then_some(primary)
         } else {
             common_dominator(&integer_uses[index], &dominators)
         }
     });
     let sp = if sp_uses.is_empty() && !conditionally_dirty.integer.sp {
         None
-    } else if integer_written.sp {
-        Some(primary)
+    } else if written.integer.sp {
+        live_entries.integer.sp.then_some(primary)
     } else {
         common_dominator(&sp_uses, &dominators)
     };
     let vector = std::array::from_fn(|index| {
         if vector_uses[index].is_empty() && !conditionally_dirty.vector[index] {
             None
-        } else if vector_written[index] {
-            Some(primary)
+        } else if written.vector[index] {
+            live_entries.vector[index].then_some(primary)
         } else {
             common_dominator(&vector_uses[index], &dominators)
         }
@@ -2758,6 +2300,43 @@ fn register_load_blocks(
         sp,
         vector,
     }
+}
+
+fn region_liveness(region: &NativeRegion) -> Vec<crate::analysis::BlockLiveness> {
+    use crate::analysis::{FlowBlock, StateSet};
+    let indexes: HashMap<_, _> = region
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, block)| (block.start.pc, i))
+        .collect();
+    let mut successors = vec![Vec::new(); region.blocks.len()];
+    let mut exits = vec![StateSet::default(); region.blocks.len()];
+    for (index, block) in region.blocks.iter().enumerate() {
+        let mut edge = |target| match indexes.get(&target) {
+            Some(&target) => successors[index].push(target),
+            None => exits[index] = StateSet::ALL,
+        };
+        match block.terminator {
+            BlockTerminator::Direct { target } => edge(target),
+            BlockTerminator::Conditional { taken, not_taken } => {
+                edge(taken);
+                edge(not_taken);
+            }
+            _ => exits[index] = StateSet::ALL,
+        }
+    }
+    let blocks: Vec<_> = region
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| FlowBlock {
+            effects: block_effects(block),
+            successors: &successors[index],
+            exit_live: exits[index],
+        })
+        .collect();
+    crate::analysis::liveness(&blocks)
 }
 
 fn block_dominators(
@@ -2977,183 +2556,33 @@ fn conditionally_dirty_at_entry(
 }
 
 fn block_dirty_state(block: &super::region::BasicBlockRecord) -> DirtyState {
-    let (_, integer_dirty, _, vector_dirty, _, fpsr_dirty) = block_register_access(block);
+    let writes = block_effects(block).writes;
     DirtyState {
-        integer: integer_dirty,
-        vector: vector_dirty,
-        fpsr: fpsr_dirty,
+        integer: writes.integer,
+        vector: writes.vector,
+        fpsr: writes.fpsr,
     }
 }
 
-fn block_register_access(
-    block: &super::region::BasicBlockRecord,
-) -> (
-    IntegerRegisterSet,
-    IntegerRegisterSet,
-    [bool; 32],
-    [bool; 32],
-    bool,
-    bool,
-) {
-    let mut integer_accessed = IntegerRegisterSet::default();
-    let mut integer_dirty = IntegerRegisterSet::default();
-    let mut vector_accessed = [false; 32];
-    let mut vector_dirty = [false; 32];
-    let mut fpsr_read = false;
-    let mut fpsr_dirty = false;
+fn block_effects(block: &super::region::BasicBlockRecord) -> crate::analysis::BlockEffects {
+    let mut effects = crate::analysis::BlockEffects::default();
     for decoded in &block.instructions {
-        match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
-            A64Instruction::Integer(instruction) => {
-                register_access_integer(instruction, &mut integer_accessed, &mut integer_dirty)
-            }
-            A64Instruction::Memory(instruction) => {
-                register_access_memory(instruction, &mut integer_accessed, &mut integer_dirty)
-            }
-            A64Instruction::System(instruction) => {
-                register_access_system(instruction, &mut integer_accessed, &mut integer_dirty);
-                let fields = instruction.operands();
-                fpsr_read |= matches!(instruction, system::Instruction::ReadRegister(_))
-                    && fields.system_key == 0xd53b_4420;
-                if matches!(instruction, system::Instruction::WriteRegister(_))
-                    && fields.system_key == 0xd51b_4420
-                {
-                    fpsr_dirty = true;
-                }
-            }
-            A64Instruction::FpSimd(instruction) => {
-                register_access_fp_simd_general(
-                    instruction,
-                    &mut integer_accessed,
-                    &mut integer_dirty,
-                );
-                register_access_fp_simd_vector(
-                    instruction,
-                    &mut vector_accessed,
-                    &mut vector_dirty,
-                );
-                if a64_fp_simd::fp_lowering_disposition(instruction).accesses_status() {
-                    fpsr_read = true;
-                    fpsr_dirty = true;
-                }
-            }
-            A64Instruction::Control(control::Instruction::BranchLinkImmediate(_)) => {
-                mark_write(&mut integer_accessed, &mut integer_dirty, 30, false);
-            }
-            A64Instruction::Control(control::Instruction::BranchRegister(fields)) => {
-                mark_read(&mut integer_accessed, fields.rn, false);
-                if fields.branch_register_key == 0xd63f_0000 {
-                    mark_write(&mut integer_accessed, &mut integer_dirty, 30, false);
-                }
-            }
-            A64Instruction::Control(
-                control::Instruction::CompareBranch(fields)
-                | control::Instruction::TestBranch(fields),
-            ) => mark_read(&mut integer_accessed, fields.rd, false),
-            _ => {}
-        }
+        effects.push(crate::analysis::instruction_effects(
+            nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding),
+        ));
     }
-    (
-        integer_accessed,
-        integer_dirty,
-        vector_accessed,
-        vector_dirty,
-        fpsr_read,
-        fpsr_dirty,
-    )
+    effects
 }
 
-fn register_access_integer(
-    instruction: integer::Instruction,
-    accessed: &mut IntegerRegisterSet,
-    dirty: &mut IntegerRegisterSet,
-) {
-    let fields = instruction.operands();
-    match instruction {
-        integer::Instruction::MoveWide(_) => {
-            let opcode = u8::from(fields.subtract) * 2 + u8::from(fields.set_flags);
-            if opcode == 3 {
-                mark_read(accessed, fields.rd, false);
-            }
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        integer::Instruction::AddSubImmediate(_) => {
-            mark_read(accessed, fields.rn, true);
-            mark_write(accessed, dirty, fields.rd, !fields.set_flags);
-        }
-        integer::Instruction::AddSubExtended(_) => {
-            mark_read(accessed, fields.rn, true);
-            mark_read(accessed, fields.rm, false);
-            mark_write(accessed, dirty, fields.rd, !fields.set_flags);
-        }
-        integer::Instruction::AddSubShifted(_) | integer::Instruction::AddSubCarry(_) => {
-            mark_read(accessed, fields.rn, false);
-            mark_read(accessed, fields.rm, false);
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        integer::Instruction::LogicalImmediate(_) => {
-            mark_read(accessed, fields.rn, false);
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        integer::Instruction::LogicalShifted(_)
-        | integer::Instruction::Extract(_)
-        | integer::Instruction::TwoSource(_)
-        | integer::Instruction::ConditionalSelect(_) => {
-            mark_read(accessed, fields.rn, false);
-            mark_read(accessed, fields.rm, false);
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        integer::Instruction::Bitfield(_) => {
-            mark_read(accessed, fields.rn, false);
-            if u8::from(fields.subtract) * 2 + u8::from(fields.set_flags) == 1 {
-                mark_read(accessed, fields.rd, false);
-            }
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        integer::Instruction::ConditionalCompareRegister(_) => {
-            mark_read(accessed, fields.rn, false);
-            mark_read(accessed, fields.rm, false);
-        }
-        integer::Instruction::ConditionalCompareImmediate(_) => {
-            mark_read(accessed, fields.rn, false);
-        }
-        integer::Instruction::ThreeSource(_) => {
-            mark_read(accessed, fields.rn, false);
-            mark_read(accessed, fields.rm, false);
-            if !matches!(fields.opcode_3, 2 | 6) {
-                mark_read(accessed, fields.ra, false);
-            }
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        integer::Instruction::OneSource(_) => {
-            mark_read(accessed, fields.rn, false);
-            mark_write(accessed, dirty, fields.rd, false);
-        }
-        integer::Instruction::Adr(_) | integer::Instruction::Adrp(_) => {
-            mark_write(accessed, dirty, fields.rd, false);
-        }
+fn region_effects(region: &NativeRegion) -> (crate::analysis::StateSet, crate::analysis::StateSet) {
+    let mut read = crate::analysis::StateSet::default();
+    let mut written = crate::analysis::StateSet::default();
+    for block in &region.blocks {
+        let effect = block_effects(block);
+        read = read.union(effect.reads);
+        written = written.union(effect.writes);
     }
-}
-
-fn mark_read(accessed: &mut IntegerRegisterSet, index: u8, register31_is_sp: bool) {
-    if index == 31 {
-        accessed.sp |= register31_is_sp;
-    } else {
-        accessed.x[usize::from(index)] = true;
-    }
-}
-
-fn mark_write(
-    _accessed: &mut IntegerRegisterSet,
-    dirty: &mut IntegerRegisterSet,
-    index: u8,
-    register31_is_sp: bool,
-) {
-    if index == 31 {
-        dirty.sp |= register31_is_sp;
-    } else {
-        let slot = usize::from(index);
-        dirty.x[slot] = true;
-    }
+    (read, written)
 }
 
 fn source_location(

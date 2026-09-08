@@ -86,6 +86,7 @@ impl NixeConfig {
                     .map(|path| resolve_path(base_directory, path))
                     .collect(),
                 recursive_scan: raw.library.recursive_scan,
+                follow_symlinks: raw.library.follow_symlinks,
             },
             filesystem: FileSystemConfig {
                 sd_card: resolve_path(base_directory, raw.filesystem.sd_card),
@@ -144,12 +145,16 @@ pub struct LibraryConfig {
     pub paths: Vec<PathBuf>,
     /// Whether directory scans descend into subdirectories.
     pub recursive_scan: bool,
+    /// Whether discovery follows symbolic links to files and directories.
+    pub follow_symlinks: bool,
 }
 
 impl LibraryConfig {
     /// Converts the shared setting to the title loader's scan options.
     pub const fn scan_options(&self) -> DirectoryScanOptions {
-        DirectoryScanOptions::new().with_recursive(self.recursive_scan)
+        DirectoryScanOptions::new()
+            .with_recursive(self.recursive_scan)
+            .with_follow_symlinks(self.follow_symlinks)
     }
 }
 
@@ -431,6 +436,8 @@ struct RawLibraryConfig {
     paths: Vec<PathBuf>,
     #[serde(default = "default_recursive_scan")]
     recursive_scan: bool,
+    #[serde(default = "default_follow_symlinks")]
+    follow_symlinks: bool,
 }
 
 #[derive(Deserialize)]
@@ -488,6 +495,10 @@ struct RawDiagnosticsConfig {
     guest_logs_level: GuestLogsLevel,
     #[serde(default)]
     file_system_access_log: bool,
+}
+
+const fn default_follow_symlinks() -> bool {
+    true
 }
 
 const fn default_recursive_scan() -> bool {
@@ -735,6 +746,7 @@ mod tests {
                 [library]
                 paths = ["./roms", "other"]
                 recursive_scan = false
+                follow_symlinks = false
                 [filesystem]
                 sd_card = "./custom-sd"
                 [system]
@@ -751,6 +763,7 @@ mod tests {
         assert_eq!(config.library.paths[0], base.join("./roms"));
         assert_eq!(config.library.paths[1], base.join("other"));
         assert!(!config.library.scan_options().recursive);
+        assert!(!config.library.scan_options().follow_symlinks);
         assert_eq!(config.filesystem.sd_card, base.join("./custom-sd"));
         assert_eq!(
             config.system.preferred_languages,
@@ -826,6 +839,8 @@ mod tests {
         let config = NixeConfig::load(&file.path).unwrap();
 
         assert!(config.library.recursive_scan);
+        assert!(config.library.follow_symlinks);
+        assert!(config.library.scan_options().follow_symlinks);
         assert_eq!(
             config.filesystem.sd_card,
             file.path.parent().unwrap().join("./storage/sdmc")

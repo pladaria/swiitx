@@ -10,16 +10,16 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
         .expect("the manifest has a production dependency section");
 
     for required in [
-        "cranelift-codegen = { version = \"=0.134.3\"",
-        "cranelift-frontend = \"=0.134.3\"",
-        "cranelift-jit = \"=0.134.3\"",
-        "cranelift-module = \"=0.134.3\"",
-        "cranelift-native = \"=0.134.3\"",
+        "cranelift-codegen = ",
+        "cranelift-frontend = ",
+        "cranelift-jit = ",
+        "cranelift-module = ",
+        "cranelift-native = ",
         "nixe-cpu.workspace = true",
         "nixe-memory.workspace = true",
     ] {
         assert!(
-            manifest.contains(required),
+            production_dependencies.contains(required),
             "missing dependency: {required}"
         );
     }
@@ -36,7 +36,11 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
         );
     }
     assert!(
-        manifest.contains("[dev-dependencies]\nnixe-cpu-interpreter.workspace = true"),
+        manifest
+            .split_once("[dev-dependencies]")
+            .unwrap()
+            .1
+            .contains("nixe-cpu-interpreter.workspace = true"),
         "the reference interpreter must remain test-only"
     );
     for forbidden in ["dynasm", "iced-x86"] {

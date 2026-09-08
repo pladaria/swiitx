@@ -7,6 +7,9 @@ paths = ["./roms/"]
 # When true, title discovery also scans subdirectories below every library path.
 # When false, only files directly inside each configured directory are scanned.
 recursive_scan = true
+# Follow symbolic links to files and directories, skipping already visited directories.
+# Linked subdirectories are scanned only when recursive_scan is true.
+follow_symlinks = true
 
 [filesystem]
 # Host directory exposed to the guest as the removable sdmc: filesystem.

@@ -28,7 +28,7 @@ Thumbs.db
 /roms/*
 !/roms/homebrew/
 !/roms/homebrew/**
-/notes/*
+/notes/
 /keys/
 /cache/
 /storage/

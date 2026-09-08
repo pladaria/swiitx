@@ -210,7 +210,15 @@ fn directory_files(root: &Path, options: DirectoryScanOptions) -> Result<Vec<Pat
 
     let mut directories = vec![root.to_owned()];
     let mut files = Vec::new();
+    let mut visited = BTreeSet::new();
     while let Some(directory) = directories.pop() {
+        if options.follow_symlinks {
+            let identity = fs::canonicalize(&directory)
+                .map_err(|error| format!("cannot resolve {}: {error}", directory.display()))?;
+            if !visited.insert(identity) {
+                continue;
+            }
+        }
         let entries = fs::read_dir(&directory)
             .map_err(|error| format!("cannot read directory {}: {error}", directory.display()))?;
         let mut nested = Vec::new();
@@ -222,6 +230,13 @@ fn directory_files(root: &Path, options: DirectoryScanOptions) -> Result<Vec<Pat
             let file_type = entry
                 .file_type()
                 .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            let file_type = if options.follow_symlinks && file_type.is_symlink() {
+                fs::metadata(&path)
+                    .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+                    .file_type()
+            } else {
+                file_type
+            };
             if file_type.is_file() {
                 files.push(path);
             } else if options.recursive && file_type.is_dir() {
@@ -304,6 +319,45 @@ mod tests {
             name: name.to_owned(),
             source: LibraryTitleSource::Homebrew(PathBuf::from(format!("{name}.nro"))),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinks_without_revisiting_directories() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "nixe-symlinks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("library")).unwrap();
+        fs::create_dir(root.join("external")).unwrap();
+        fs::write(root.join("external/game.nro"), []).unwrap();
+        fs::write(root.join("standalone.nro"), []).unwrap();
+        symlink(root.join("external"), root.join("library/linked")).unwrap();
+        symlink(root.join("external"), root.join("library/duplicate")).unwrap();
+        symlink(root.join("library"), root.join("external/cycle")).unwrap();
+        symlink(root.join("standalone.nro"), root.join("library/file.nro")).unwrap();
+        let scan = |options| {
+            directory_files(&root.join("library"), options)
+                .unwrap_or_else(|_| panic!("directory discovery failed"))
+        };
+        let files = scan(DirectoryScanOptions::new());
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("game.nro")));
+        assert!(files.iter().any(|path| path.ends_with("file.nro")));
+        assert!(scan(DirectoryScanOptions::new().with_follow_symlinks(false)).is_empty());
+        assert_eq!(
+            scan(DirectoryScanOptions::new().with_recursive(false)),
+            vec![root.join("library/file.nro")]
+        );
+        symlink(root.join("missing"), root.join("library/broken")).unwrap();
+        assert!(directory_files(&root.join("library"), DirectoryScanOptions::new()).is_err());
+        assert!(scan(DirectoryScanOptions::new().with_follow_symlinks(false)).is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
